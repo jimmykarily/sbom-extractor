@@ -1,5 +1,7 @@
 # sbom-extractor
 
+NOTE: This is a vide-coded conversion of this bash script: https://github.com/kairos-io/kairos/issues/3615#issuecomment-3219538696
+
 A simple tool to extract pre-attached SBOMs from container image OCI attestations.
 
 ## Why?
