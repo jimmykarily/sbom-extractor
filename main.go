@@ -119,18 +119,8 @@ func extractSBOM(config *Config) error {
 		return fmt.Errorf("invalid image reference: %w", err)
 	}
 
-	// Get subject digest
-	subjectDigest, err := getSubjectDigest(ref, config.Platform)
-	if err != nil {
-		return fmt.Errorf("failed to get subject digest: %w", err)
-	}
-
-	if config.Verbose {
-		log.Printf("Subject digest: %s", subjectDigest)
-	}
-
-	// Find attestation manifests
-	attestationDigests, err := findAttestationManifests(ref, subjectDigest)
+	// Find attestation manifests (we'll discover subject digests from the image index)
+	attestationDigests, err := findAttestationManifests(ref, config.Platform, config.Verbose)
 	if err != nil {
 		return fmt.Errorf("failed to find attestation manifests: %w", err)
 	}
@@ -188,37 +178,6 @@ func extractSBOM(config *Config) error {
 	return nil
 }
 
-func getSubjectDigest(ref name.Reference, platform string) (string, error) {
-	// If reference already contains a digest, use it
-	if digest, ok := ref.(name.Digest); ok {
-		return digest.DigestStr(), nil
-	}
-
-	// Get the digest for the reference
-	desc, err := remote.Get(ref)
-	if err != nil {
-		return "", err
-	}
-
-	// If platform specified, resolve platform-specific digest
-	if platform != "" {
-		plat := parsePlatform(platform)
-		if plat != nil {
-			img, err := remote.Image(ref, remote.WithPlatform(*plat))
-			if err != nil {
-				return "", err
-			}
-			digest, err := img.Digest()
-			if err != nil {
-				return "", err
-			}
-			return digest.String(), nil
-		}
-	}
-
-	return desc.Digest.String(), nil
-}
-
 func parsePlatform(platform string) *v1.Platform {
 	plat, err := v1.ParsePlatform(platform)
 	if err != nil {
@@ -227,7 +186,7 @@ func parsePlatform(platform string) *v1.Platform {
 	return plat
 }
 
-func findAttestationManifests(ref name.Reference, subjectDigest string) ([]string, error) {
+func findAttestationManifests(ref name.Reference, platform string, verbose bool) ([]string, error) {
 	// Try to get the image index/manifest list
 	desc, err := remote.Get(ref)
 	if err != nil {
@@ -239,17 +198,68 @@ func findAttestationManifests(ref name.Reference, subjectDigest string) ([]strin
 		return nil, fmt.Errorf("failed to parse image index: %w", err)
 	}
 
-	var attestationDigests []string
+	if verbose {
+		log.Printf("Found %d manifests in index", len(index.Manifests))
+	}
+
+	// Build a set of all potential subject digests (all image manifests in the index)
+	subjectDigests := make(map[string]bool)
 	for _, manifest := range index.Manifests {
-		// Check if this is an attestation manifest
-		if refType, ok := manifest.Annotations["vnd.docker.reference.type"]; ok && refType == "attestation-manifest" {
-			// Check if it references our subject (if digest specified)
-			if refDigest, ok := manifest.Annotations["vnd.docker.reference.digest"]; ok {
-				if refDigest == subjectDigest {
-					attestationDigests = append(attestationDigests, manifest.Digest)
+		// Only consider actual image manifests, not attestation manifests
+		if manifest.Annotations == nil || manifest.Annotations["vnd.docker.reference.type"] != "attestation-manifest" {
+			// If platform specified, filter by platform
+			if platform != "" {
+				if manifest.Platform != nil {
+					plat := parsePlatform(platform)
+					if plat != nil &&
+						manifest.Platform.Architecture == plat.Architecture &&
+						manifest.Platform.OS == plat.OS {
+						subjectDigests[manifest.Digest] = true
+						if verbose {
+							log.Printf("Subject digest for platform %s: %s", platform, manifest.Digest)
+						}
+					}
 				}
 			} else {
-				// If no specific subject reference, include it anyway
+				// No platform specified, include all image manifests
+				subjectDigests[manifest.Digest] = true
+				if verbose {
+					log.Printf("Subject digest: %s", manifest.Digest)
+				}
+			}
+		}
+	}
+
+	var attestationDigests []string
+	for _, manifest := range index.Manifests {
+		if verbose {
+			log.Printf("Checking manifest: %s, MediaType: %s", manifest.Digest, manifest.MediaType)
+			if manifest.Annotations != nil {
+				log.Printf("  Annotations: %+v", manifest.Annotations)
+			}
+		}
+
+		// Check if this is an attestation manifest
+		if refType, ok := manifest.Annotations["vnd.docker.reference.type"]; ok && refType == "attestation-manifest" {
+			if verbose {
+				log.Printf("Found attestation manifest: %s", manifest.Digest)
+			}
+
+			// Check if it references any of our subject digests
+			if refDigest, ok := manifest.Annotations["vnd.docker.reference.digest"]; ok {
+				if subjectDigests[refDigest] {
+					if verbose {
+						log.Printf("Attestation references subject digest: %s", refDigest)
+					}
+					attestationDigests = append(attestationDigests, manifest.Digest)
+				} else if verbose {
+					log.Printf("Attestation references unknown digest: %s", refDigest)
+				}
+			} else {
+				// If no specific subject reference, include it anyway (less common)
+				if verbose {
+					log.Printf("Attestation has no subject reference, including anyway")
+				}
 				attestationDigests = append(attestationDigests, manifest.Digest)
 			}
 		}
